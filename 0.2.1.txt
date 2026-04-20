@@ -1,0 +1,351 @@
+// =============================================
+// Discord Quest 自动刷任务 0.2.1 - 修复 localStorage 错误版
+// 0.2 → 0.2.1（已修复 localStorage）
+// 使用方法: Discord 桌面端 → Ctrl+Shift+I → Console → 全选粘贴
+// =============================================
+
+delete window.$;
+
+const wpRequire = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+webpackChunkdiscord_app.pop();
+
+// ==================== 配置区 ====================
+const CONFIG = {
+    version: "8.1",
+    supportedTasks: new Set([
+        "WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY",
+        "WATCH_VIDEO_ON_MOBILE", "PLAY_ON_DESKTOP_V2", "PLAY_ON_XBOX",
+        "PLAY_ON_PLAYSTATION", "ACHIEVEMENT_IN_ACTIVITY"
+    ]),
+    skipTasks: new Set([]),                                 // 例: new Set(["STREAM_ON_DESKTOP"])
+    delay: { enroll: 500, refresh: 1000, nextJob: 600 },
+    video: { speed: 9, maxFuture: 15, interval: 700 },
+    autoDaily: true,
+    dailyCheckInterval: 15 * 60 * 1000,
+    apiRetry: 3,
+    taskTimeout: 2 * 60 * 60 * 1000,
+    logThrottle: 15000
+};
+
+const isApp = typeof DiscordNative !== "undefined";
+
+// ==================== 模块缓存 & 自动刷新 ====================
+let modules = {};
+let moduleCacheTime = Date.now();
+
+const getModule = (filter, name) => {
+    if (modules[name] && Date.now() - moduleCacheTime < 300000) return modules[name];
+    const found = Object.values(wpRequire.c).find(filter)?.exports;
+    if (found) {
+        modules[name] = found;
+        moduleCacheTime = Date.now();
+    }
+    return found;
+};
+
+let ApplicationStreamingStore, RunningGameStore, QuestsStore, ChannelStore, GuildChannelStore, FluxDispatcher, api;
+
+function refreshModules() {
+    ApplicationStreamingStore = getModule(x => x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata, 'StreamingStore').A;
+    RunningGameStore = getModule(x => x?.exports?.Ay?.getRunningGames, 'RunningGameStore').Ay;
+    QuestsStore = getModule(x => x?.exports?.A?.__proto__?.getQuest, 'QuestsStore').A;
+    ChannelStore = getModule(x => x?.exports?.A?.__proto__?.getAllThreadsForParent, 'ChannelStore').A;
+    GuildChannelStore = getModule(x => x?.exports?.Ay?.getSFWDefaultChannel, 'GuildChannelStore').Ay;
+    FluxDispatcher = getModule(x => x?.exports?.h?.__proto__?.flushWaitQueue, 'FluxDispatcher').h;
+    api = getModule(x => x?.exports?.Bo?.get, 'api').Bo;
+    console.log("🔄 模块已刷新");
+}
+
+refreshModules();
+window.forceReloadModules = refreshModules;
+
+// ==================== 全局状态 & 清理 ====================
+let isRunning = false;
+let activeListeners = new Map();
+let originalFunctions = new Map();
+let lastLogTime = 0;
+
+// 智能 localStorage 封装（修复核心）
+const safeStorage = {
+    getItem: (key) => {
+        try { return localStorage.getItem(key); } catch { return window.__questLastRun || null; }
+    },
+    setItem: (key, value) => {
+        try { localStorage.setItem(key, value); } catch { window.__questLastRun = value; }
+    }
+};
+
+const cleanup = () => {
+    activeListeners.forEach((fn, event) => { try { FluxDispatcher.unsubscribe(event, fn); } catch {} });
+    activeListeners.clear();
+    if (originalFunctions.has('RunningGameStore')) {
+        const orig = originalFunctions.get('RunningGameStore');
+        RunningGameStore.getRunningGames = orig.getRunningGames;
+        RunningGameStore.getGameForPID = orig.getGameForPID;
+    }
+    if (originalFunctions.has('StreamingStore')) {
+        ApplicationStreamingStore.getStreamerActiveStreamMetadata = originalFunctions.get('StreamingStore');
+    }
+    originalFunctions.clear();
+    console.log("🧹 所有伪造状态已清理");
+};
+
+window.cleanupQuests = cleanup;
+
+// ==================== 辅助函数 ====================
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const getToday = () => new Date().toISOString().slice(0, 10);
+
+const apiCall = async (method, url, body = null) => {
+    for (let i = 0; i <= CONFIG.apiRetry; i++) {
+        try {
+            if (!api) refreshModules();
+            return await api[method]({ url, body });
+        } catch (e) {
+            if (i === CONFIG.apiRetry) throw e;
+            await sleep(600 * Math.pow(1.6, i));
+            if (i >= 1) refreshModules();
+        }
+    }
+};
+
+const throttledLog = (msg) => {
+    const now = Date.now();
+    if (now - lastLogTime > CONFIG.logThrottle) {
+        console.log(msg);
+        lastLogTime = now;
+    }
+};
+
+// ==================== 智能任务摘要 ====================
+async function printQuestSummary() {
+    const active = [...QuestsStore.quests.values()].filter(q => 
+        q.userStatus?.enrolledAt && !q.userStatus?.completedAt && new Date(q.config.expiresAt) > Date.now()
+    );
+    console.log(`📊 ver${CONFIG.version} 当前进行中任务（${active.length} 个）：`);
+    active.forEach(q => {
+        const tc = q.config.taskConfig ?? q.config.taskConfigV2;
+        const task = Array.from(CONFIG.supportedTasks).find(t => tc.tasks[t] != null && !CONFIG.skipTasks.has(t));
+        if (!task) return;
+        const need = tc.tasks[task].target;
+        const done = q.userStatus?.progress?.[task]?.value ?? 0;
+        console.log(`   • ${q.config.messages.questName} | ${task} | ${done}/${need} 剩余≈${Math.ceil((need-done)/60)}分钟`);
+    });
+}
+
+// ==================== 自动每日运行（已修复） ====================
+let dailyTimer = null;
+function setupDailyRunner() {
+    if (!CONFIG.autoDaily || dailyTimer) return;
+    console.log("🌅【自动每日运行】已开启（15分钟检查） - localStorage 已修复");
+
+    const check = async () => {
+        if (safeStorage.getItem('discordQuestLastRun') === getToday()) return;
+        const hasActive = [...QuestsStore.quests.values()].some(q => 
+            q.userStatus?.enrolledAt && !q.userStatus?.completedAt && new Date(q.config.expiresAt) > Date.now()
+        );
+        if (hasActive) {
+            console.log("🌅 新一天 + 发现可刷任务 → 自动启动 ver8.1");
+            await main();
+            safeStorage.setItem('discordQuestLastRun', getToday());
+        }
+    };
+
+    check();
+    dailyTimer = setInterval(check, CONFIG.dailyCheckInterval);
+
+    window.stopAutoQuestDaily = () => { clearInterval(dailyTimer); dailyTimer = null; console.log("⏹️ 每日自动已停止"); };
+    window.runQuestsNow = main;
+    window.questStatus = printQuestSummary;
+    window.getQuestVersion = () => console.log(`✅ 当前脚本版本: ver${CONFIG.version}`);
+}
+
+// ==================== 主流程 & 核心任务处理器（保持 ver8 极致优化） ====================
+async function main() {
+    if (isRunning) { console.warn("⚠️ 脚本已在运行中"); return; }
+    isRunning = true;
+    console.log(`🚀 Quest 自动刷任务 ver${CONFIG.version} 启动...`);
+
+    try {
+        await printQuestSummary();
+        if (!api) refreshModules();
+
+        try { await apiCall('get', "/quests/@me"); } catch {}
+
+        await sleep(CONFIG.delay.refresh);
+
+        const toEnroll = [...QuestsStore.quests.values()].filter(x => 
+            !x.userStatus?.enrolledAt && new Date(x.config.expiresAt) > Date.now() &&
+            Array.from(CONFIG.supportedTasks).some(t => Object.keys((x.config.taskConfig ?? x.config.taskConfigV2).tasks).includes(t))
+        );
+
+        if (toEnroll.length > 0) {
+            console.log(`📥 领取 ${toEnroll.length} 个新任务...`);
+            for (const q of toEnroll) {
+                try { await apiCall('post', `/quests/${q.id}/enroll`, { location: 1 }); } catch {}
+                await sleep(CONFIG.delay.enroll);
+            }
+        }
+
+        await sleep(CONFIG.delay.refresh);
+
+        const activeQuests = [...QuestsStore.quests.values()].filter(q => 
+            q.userStatus?.enrolledAt && !q.userStatus?.completedAt &&
+            new Date(q.config.expiresAt) > Date.now() &&
+            !CONFIG.skipTasks.has(Array.from(CONFIG.supportedTasks).find(t => 
+                (q.config.taskConfig ?? q.config.taskConfigV2).tasks[t] != null))
+        );
+
+        if (activeQuests.length === 0) {
+            console.log("🎉 所有支持任务已完成！");
+            return;
+        }
+
+        console.log(`🔥 顺序执行 ${activeQuests.length} 个任务...`);
+        for (const quest of activeQuests) {
+            await processQuest(quest);
+            await sleep(CONFIG.delay.nextJob);
+        }
+
+        await printQuestSummary();
+    } catch (e) {
+        console.error("💥 主流程异常，已自动清理", e.message);
+        cleanup();
+    } finally {
+        isRunning = false;
+    }
+}
+
+// ==================== 核心任务处理器（与 ver8 一致） ====================
+async function processQuest(quest) {
+    const timeoutId = setTimeout(() => {
+        console.warn(`⏰ 任务超时，已强制清理: ${quest.config.messages.questName}`);
+        cleanup();
+    }, CONFIG.taskTimeout);
+
+    try {
+        const questName = quest.config.messages.questName;
+        const tc = quest.config.taskConfig ?? quest.config.taskConfigV2;
+        const taskName = Array.from(CONFIG.supportedTasks).find(t => tc.tasks[t] != null);
+        if (CONFIG.skipTasks.has(taskName)) return;
+
+        const secondsNeeded = tc.tasks[taskName].target;
+        let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+
+        console.log(`📌 开始: ${questName} (${taskName})`);
+
+        if (taskName === "PLAY_ON_DESKTOP" || taskName === "PLAY_ON_DESKTOP_V2") {
+            if (!isApp) { console.warn(`❌ ${taskName} 仅桌面端支持`); return; }
+            const pid = Math.floor(Math.random() * 30000) + 1000;
+            const appData = (await apiCall('get', `/applications/public?application_ids=${quest.config.application.id}`)).body[0];
+            const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">", "") ?? appData.name.replace(/[\\/:*?"<>|]/g, "");
+
+            const fakeGame = {
+                cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                exeName, exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                hidden: false, isLauncher: false, id: quest.config.application.id,
+                name: appData.name, pid, pidPath: [pid],
+                processName: appData.name, start: Date.now()
+            };
+
+            originalFunctions.set('RunningGameStore', {
+                getRunningGames: RunningGameStore.getRunningGames,
+                getGameForPID: RunningGameStore.getGameForPID
+            });
+
+            RunningGameStore.getRunningGames = () => [fakeGame];
+            RunningGameStore.getGameForPID = () => fakeGame;
+
+            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: [fakeGame], games: [fakeGame] });
+
+            const fn = data => {
+                const progress = quest.config.configVersion === 1 ? data.userStatus.streamProgressSeconds : Math.floor(data.userStatus.progress[taskName]?.value ?? data.userStatus.progress.PLAY_ON_DESKTOP?.value ?? 0);
+                if (progress >= secondsNeeded) {
+                    console.log(`🎉 ${taskName} 完成: ${questName}`);
+                    cleanup();
+                }
+            };
+            FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            activeListeners.set("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+
+            console.log(`⏳ 剩余 ≈${Math.ceil((secondsNeeded - secondsDone)/60)} 分钟`);
+
+        } else if (taskName === "STREAM_ON_DESKTOP") {
+            if (!isApp) { console.warn(`❌ STREAM_ON_DESKTOP 仅桌面端支持`); return; }
+            const pid = Math.floor(Math.random() * 30000) + 1000;
+            const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+            originalFunctions.set('StreamingStore', realFunc);
+            ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({ id: quest.config.application.id, pid, sourceName: null });
+
+            const fn = data => {
+                const progress = quest.config.configVersion === 1 ? data.userStatus.streamProgressSeconds : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
+                if (progress >= secondsNeeded) {
+                    console.log(`🎉 串流完成: ${questName}`);
+                    cleanup();
+                }
+            };
+            FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            activeListeners.set("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            console.log(`⚠️ 请在语音频道开启串流（需至少1名成员）`);
+
+        } else if (taskName.includes("WATCH_VIDEO")) {
+            const { speed, maxFuture, interval } = CONFIG.video;
+            const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
+
+            const progressLoop = async () => {
+                if (secondsDone >= secondsNeeded) return;
+                const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
+                if (maxAllowed - secondsDone >= speed) {
+                    const ts = Math.min(secondsNeeded, secondsDone + speed + Math.random() * 4);
+                    try {
+                        await apiCall('post', `/quests/${quest.id}/video-progress`, { timestamp: ts });
+                        secondsDone = ts;
+                        throttledLog(`📺 ${questName} 进度: ${Math.floor(secondsDone)}/${secondsNeeded}`);
+                    } catch {}
+                }
+                if ('requestIdleCallback' in window) {
+                    requestIdleCallback(() => setTimeout(progressLoop, interval));
+                } else {
+                    setTimeout(progressLoop, interval);
+                }
+            };
+            progressLoop();
+
+            while (secondsDone < secondsNeeded) await sleep(6000);
+            await apiCall('post', `/quests/${quest.id}/video-progress`, { timestamp: secondsNeeded });
+            console.log(`🎉 视频任务完成: ${questName}`);
+
+        } else if (taskName === "PLAY_ACTIVITY") {
+            const channelId = ChannelStore.getSortedPrivateChannels()[0]?.id ?? Object.values(GuildChannelStore.getAllGuilds()).find(g => g?.VOCAL?.length)?.VOCAL[0]?.channel?.id;
+            if (!channelId) { console.warn("❌ 找不到语音频道"); return; }
+            const streamKey = `call:${channelId}:1`;
+            let progress = 0;
+            while (progress < secondsNeeded) {
+                try {
+                    const res = await apiCall('post', `/quests/${quest.id}/heartbeat`, { stream_key: streamKey, terminal: false });
+                    progress = res.body.progress.PLAY_ACTIVITY.value;
+                    throttledLog(`🎤 语音进度: ${progress}/${secondsNeeded}`);
+                } catch {}
+                await sleep(18000);
+            }
+            await apiCall('post', `/quests/${quest.id}/heartbeat`, { stream_key: streamKey, terminal: true });
+            console.log(`🎉 语音活动完成: ${questName}`);
+
+        } else if (["PLAY_ON_XBOX", "PLAY_ON_PLAYSTATION", "ACHIEVEMENT_IN_ACTIVITY"].includes(taskName)) {
+            console.warn(`⚠️ ${taskName} 暂不支持桌面端自动刷取（需主机手动）`);
+            return;
+        }
+
+    } catch (e) {
+        console.warn(`⚠️ 任务异常: ${quest.config.messages.questName}`, e.message);
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+// ==================== 启动 ====================
+main().then(setupDailyRunner).catch(err => {
+    console.error("💥 启动异常，已清理", err.message);
+    isRunning = false;
+    cleanup();
+});
